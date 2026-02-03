@@ -1,0 +1,234 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>HIDS 仪表盘</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+      :root{ --gap:16px; --card-bg:#ffffff; --card-border:#e6e6e6; }
+      body { font-family: Arial, sans-serif; margin: 18px; background:#f7f9fb; color:#222 }
+      .grid { display:grid; gap:var(--gap); grid-template-columns: repeat(2, 1fr); align-items:start; }
+      @media (max-width:900px){ .grid{ grid-template-columns: repeat(1, 1fr); } }
+  .card { border:1px solid var(--card-border); padding:12px; border-radius:8px; background:var(--card-bg); box-shadow:0 1px 3px rgba(0,0,0,0.04); }
+      .card h3{ margin:0 0 8px 0; font-size:16px }
+    .card .controls{ margin-bottom:8px }
+    table { border-collapse: collapse; width:100%; font-size:13px }
+    th, td { border:1px solid #f0f0f0; padding:6px; text-align:left; }
+  .chart-wrap{ width:100%; max-height:420px; display:flex; align-items:center; }
+  .chart-wrap canvas{ width:100% !important; height:100% !important; }
+  /* memory card specific layout: chart left, legend right */
+   .mem-container{ display:flex; gap:12px; align-items:flex-start }
+   .mem-chart-wrap{ flex:1.6; min-width:220px } /* increase left chart area and reduce legend width to enlarge pie */
+   .mem-legend{ width:160px; flex-shrink:0 }
+    .mem-chart-wrap{ flex:2; min-width:160px }
+  .mem-legend{ width:160px; flex-shrink:0 }
+  .legend-item{ display:flex; gap:8px; align-items:center; padding:4px 0; font-size:13px }
+  .legend-color{ width:14px; height:14px; border-radius:3px; display:inline-block }
+  @media (max-width:900px){ .mem-container{ flex-direction:column } .mem-legend{ width:auto } }
+  /* status badges */
+  .badge{ display:inline-block; padding:2px 8px; border-radius:12px; font-size:12px; color:#fff }
+  .badge-created{ background:#28a745 }
+  .badge-modified{ background:#ff9800 }
+  .badge-deleted{ background:#d32f2f }
+  .badge-moved{ background:#7b1fa2 }
+  .badge-opened{ background:#1976d2 }
+  .badge-active{ background:#28a745 }
+  .badge-inactive{ background:#6c757d }
+  .badge-failed{ background:#d32f2f }
+  .badge-unknown{ background:#ff9800 }
+    </style>
+  </head>
+  <body>
+  <h2 style="display:flex; justify-content:space-between; align-items:center">HIDS 仪表盘 <small id="lastUpdated" style="font-size:12px; color:#666">最近更新时间：--</small></h2>
+    <div class="grid">
+  <div class="card" id="card-mem">
+    <h3>内存占用</h3>
+  <div class="mem-container"><div class="mem-chart-wrap"><div class="chart-wrap"><canvas id="memChart" height="220"></canvas></div></div><div class="mem-legend" id="memLegend" aria-hidden="false"></div></div>
+  <div style="margin-top:8px;"><div class="mem-table-wrap" style="max-height:220px; overflow:auto;"><table id="memTable"></table></div></div>
+  </div>
+
+      <div class="card" id="card-net">
+        <h3>最近十分钟网络流量统计</h3>
+  <div class="chart-wrap"><canvas id="netChart" height="220"></canvas></div>
+        <div style="margin-top:8px; overflow:auto"><table id="netTable"></table></div>
+      </div>
+
+      <div class="card" id="card-file">
+        <h3>文件读写事件</h3>
+        <div class="controls">
+          <label>监控路径: <strong id="currentPath">(loading)</strong></label>
+        </div>
+        <div class="controls" style="display:flex; gap:8px">
+          <input id="pathInput" style="flex:1; padding:6px" placeholder="/path/to/file_or_dir" />
+          <button id="setPathBtn">设置</button>
+        </div>
+        <div id="fileEvents" style="max-height:320px; overflow:auto; margin-top:6px;"></div>
+      </div>
+
+      <div class="card" id="card-startup">
+        <h3>启动进程 / 服务</h3>
+        <div id="startup" style="max-height:360px; overflow:auto;"></div>
+      </div>
+    </div>
+
+    <script>
+      async function fetchJSON(url){
+        const r = await fetch(url);
+        return r.json();
+      }
+
+      let memChart = null;
+      let netChart = null;
+
+      const palette = ['#4dc9f6','#f67019','#f53794','#537bc4','#acc236','#166a8f','#00a950','#58595b','#8549ba','#ff6384','#36a2eb','#ffce56'];
+
+      async function updateMemory(){
+        const data = await fetchJSON('/api/memory?n=15');
+        const labels = data.map(d => d.name + ' ('+Math.round(d.mem_rss/1024/1024)+'MB)');
+        const values = data.map(d => Math.round(d.mem_rss/1024/1024));
+        const colors = labels.map((_,i)=>palette[i % palette.length]);
+        const table = document.getElementById('memTable');
+          // helper to render PIDs with collapse when many
+          function renderPids(pids){
+            if(!pids || pids.length===0) return '';
+            const max = 3;
+            if(pids.length<=max) return pids.join(',');
+            const visible = pids.slice(0,max).join(',');
+            const hidden = pids.slice(max).join(',');
+            const moreCount = pids.length - max;
+            // create collapse structure: visible span, hidden span, toggle link
+            return `<span class="pids-visible">${visible}</span><span class="pids-ellipsis">…</span> <a href="#" class="pids-toggle" data-hidden="${hidden}" data-visible="${visible}" data-more="${moreCount}">(+${moreCount})</a>`;
+          }
+
+          table.innerHTML = '<tr><th>应用</th><th>RSS (MB)</th><th>%</th><th>PIDs</th></tr>' + data.map(d=>`<tr><td>${d.name}</td><td>${Math.round(d.mem_rss/1024/1024)}</td><td>${d.mem_percent.toFixed(2)}</td><td>${renderPids(d.pids)}</td></tr>`).join('');
+        if(!memChart){
+          const ctx = document.getElementById('memChart').getContext('2d');
+          memChart = new Chart(ctx, {type:'pie', data:{labels, datasets:[{data:values, backgroundColor:colors}]}, options:{responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}}});
+        }else{
+          memChart.data.labels = labels; memChart.data.datasets[0].data = values; memChart.data.datasets[0].backgroundColor = colors; memChart.update();
+        }
+          // build right-side legend
+          try{
+            const legendEl = document.getElementById('memLegend');
+            if(legendEl){
+              legendEl.innerHTML = labels.map((lab,i)=>`<div class="legend-item"><span class="legend-color" style="background:${colors[i]}"></span><div>${lab}</div></div>`).join('');
+            }
+          }catch(e){
+            // ignore
+          }
+          // attach toggle handlers for PID collapse
+          try{
+            document.querySelectorAll('.pids-toggle').forEach(a=>{
+              a.addEventListener('click', (ev)=>{
+                ev.preventDefault();
+                const parent = a.parentElement;
+                const hidden = a.getAttribute('data-hidden');
+                const visible = a.getAttribute('data-visible');
+                const more = a.getAttribute('data-more');
+                const expanded = a.getAttribute('data-expanded') === '1';
+                if(!expanded){
+                  // expand: show all, change link to collapse
+                  parent.innerHTML = `${visible},${hidden} <a href="#" class="pids-toggle-collapse">收起</a>`;
+                  parent.querySelector('.pids-toggle-collapse').addEventListener('click', (e)=>{ e.preventDefault(); updateMemory(); });
+                }else{
+                  updateMemory();
+                }
+              });
+            });
+          }catch(err){ /* ignore */ }
+      }
+
+      async function updateNetwork(){
+        const data = await fetchJSON('/api/network?minutes=10');
+        const labels = data.slice(0,15).map(d => d.name + ' ('+d.pid+')');
+        const values = data.slice(0,15).map(d => Math.round(d.bytes/1024));
+        const table = document.getElementById('netTable');
+        table.innerHTML = '<tr><th>进程</th><th>PID</th><th>Bytes</th></tr>' + data.slice(0,50).map(d=>`<tr><td>${d.name}</td><td>${d.pid}</td><td>${d.bytes}</td></tr>`).join('');
+        if(!netChart){
+          const ctx = document.getElementById('netChart').getContext('2d');
+          netChart = new Chart(ctx, {type:'bar', data:{labels, datasets:[{label:'KB', data:values, backgroundColor:'rgba(255,99,132,0.6)'}]}, options:{responsive:true, maintainAspectRatio:false}});
+        }else{
+          netChart.data.labels = labels; netChart.data.datasets[0].data = values; netChart.update();
+        }
+      }
+
+      async function updateFileEvents(){
+        const data = await fetchJSON('/api/file_events');
+        const el = document.getElementById('fileEvents');
+        // map event types to badge classes
+        function fileBadge(type){
+          if(!type) return 'badge-unknown';
+          const t = type.toLowerCase();
+          if(t.includes('create') || t.includes('created')) return 'badge-created';
+          if(t.includes('modify') || t.includes('modified')) return 'badge-modified';
+          if(t.includes('delete') || t.includes('deleted')) return 'badge-deleted';
+          if(t.includes('move') || t.includes('moved')) return 'badge-moved';
+          if(t.includes('open') || t.includes('opened')) return 'badge-opened';
+          return 'badge-unknown';
+        }
+        el.innerHTML = data.slice(0,200).map(e=>{
+          const t = e.event_type || '';
+          const cls = fileBadge(t);
+          return `<div>${new Date(e.time*1000).toLocaleString()} - <span class="badge ${cls}">${t}</span> - ${e.src_path}</div>`;
+        }).join('');
+      }
+
+      async function fetchWatchPath(){
+        try{
+          const j = await fetchJSON('/api/file_watch');
+          document.getElementById('currentPath').textContent = j.path || '(none)';
+          document.getElementById('pathInput').value = j.path || '';
+        }catch(e){
+          document.getElementById('currentPath').textContent = '(error)';
+        }
+      }
+
+      document.getElementById('setPathBtn').addEventListener('click', async ()=>{
+        const v = document.getElementById('pathInput').value.trim();
+        if(!v) return alert('请输入路径');
+        try{
+          const r = await fetch('/api/file_watch',{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({path:v})});
+          const j = await r.json();
+          if(r.ok){
+            document.getElementById('currentPath').textContent = j.path;
+            alert('设置成功');
+          }else{
+            alert('设置失败: '+(j.error||'unknown'));
+          }
+        }catch(e){
+          alert('请求失败: '+e);
+        }
+      });
+
+      async function updateStartup(){
+        const data = await fetchJSON('/api/startup');
+        const s = data.services_enabled || [];
+        const p = data.ppid1_processes || [];
+        function svcBadge(a){
+          if(!a) return 'badge-unknown';
+          const t = a.toLowerCase();
+          if(t === 'active' || t === 'running') return 'badge-active';
+          if(t === 'inactive' || t === 'disabled') return 'badge-inactive';
+          if(t === 'failed') return 'badge-failed';
+          return 'badge-unknown';
+        }
+        const servicesHtml = s.slice(0,50).map(x=>`<div>${x.name} - <span class="badge ${svcBadge(x.active)}">${x.active}</span></div>`).join('');
+        const ppidHtml = p.map(x=>`<div>${x.pid} ${x.name} (${x.username})</div>`).join('');
+        document.getElementById('startup').innerHTML = '<h4>enabled services</h4>' + servicesHtml + '<h4>ppid=1 processes</h4>' + ppidHtml;
+      }
+
+      async function tick(){
+        await Promise.all([updateMemory(), updateNetwork(), updateFileEvents(), updateStartup()]);
+        try{
+          const el = document.getElementById('lastUpdated');
+          if(el) el.textContent = '最近更新时间：' + new Date().toLocaleString();
+        }catch(e){ }
+      }
+
+  fetchWatchPath();
+  tick();
+  setInterval(tick, 5000);
+  setInterval(fetchWatchPath, 15000);
+    </script>
+  </body>
+</html>
